@@ -3,8 +3,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DilatedConv1d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, dilation, padding="same"):
+    # def __init__(self, in_channels, out_channels, kernel_size, dilation, padding="same"):
+    #     super(DilatedConv1d, self).__init__()
+    def __init__(self, in_channels, out_channels, kernel_size, dilation):
         super(DilatedConv1d, self).__init__()
+        # 手动计算padding以确保输出长度与输入相同
+        # 对于奇数kernel_size，padding = (kernel_size - 1) * dilation // 2
+        # 这样可以保持序列长度不变
+        padding = (kernel_size - 1) * dilation // 2
         self.conv = nn.Conv1d(
             in_channels, out_channels, kernel_size, 
             dilation=dilation, padding=padding

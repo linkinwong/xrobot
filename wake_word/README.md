@@ -36,7 +36,7 @@
 | ✅ | 训练PyTorch模型 | 2025-06-21 | 成功训练出初版模型，toy数据4个识别出3个 | 构建好第一版模型，使用少量数据+负例（开源噪音等数据） |
 | -  | 每日开发记录 | 2025-06-23 | 找到10G的负例数据，开发出GPU版模型，训练速度提升很多倍；torch版模型120K；10条安静环境的测试数据准确率接近90% | - |
 | ✅  | 构造合成数据 | 2025-06-24 | 使用70多个典型音色合成了500多条唤醒词数据,负例用了6000多条；GPU上训练10个epoch后准确率94%（linux上），由于测试数据量大，结果可靠。未优化和量化的模型是120K，可进一步变小。可适应流式推理。数据和代码 https://github.com/qbox/xrobot/pull/4 | 完成第二版模型，使用优化的CosyVoice（文本转语音）及多种人物音色生成语音。  |
-| ⬜ | 优化识别模型 | 2025-06-25 | - | 在合成数据上训练，获得轻量级ONNX模型，速度没问题 |
+| ✅  | 优化识别模型 | 2025-06-25 | 转为 onnx 模型，从 120K 优化到 60K， 因此速度比较快。定位到了[静音高误触发问题](#实验分析与问题解决)，解决中。 | 在合成数据上训练，获得轻量级ONNX模型，速度没问题。 |
 | ⬜ | ESP芯片适配 | 2025-06-26 | - | 将ONNX模型转为ESP芯片格式，在实体机上测试 |
 | ⬜ | 效果提升 | 持续进行 | - | 为TTS合成的训练数据加入噪音，模拟真实环境 |
 
@@ -50,12 +50,6 @@
 正例使用tts合成，已扩展到5百多条。
 
 
-音频文件要求:
-- 格式: WAV
-- 采样率: 16kHz
-- 声道: 单声道
-- 编码: 16位有符号整数
-- 建议每个样本持续时间: 1-2秒
 
 数据集目录结构:
 dataset/
@@ -92,48 +86,9 @@ python pipeline.py
 
 
 
-
-
-
 ### 1. 模型架构
 
-#### 1.1 整体网络结构
 
-本项目采用基于空洞卷积(Dilated Convolution)的轻量级网络架构DilatedWakeNet，专为ESP32-S3等资源受限设备设计。
-
-
-[//]: # (comment)
-
-```mermaid
-graph TB
-    subgraph "DilatedWakeNet架构"
-        A[MFCC输入<br/>13 x 40]-->B[输入卷积层<br/>1x1 Conv, 32通道]
-        B--> C[空洞卷积层1<br/>3x1 Conv, dilation=1]
-        C--> D[空洞卷积层2<br/>3x1 Conv, dilation=2]
-        D --> E[空洞卷积层3<br/>3x1 Conv, dilation=4]
-        E --> F[空洞卷积层4<br/>3x1 Conv, dilation=8]
-        F --> G[输出层<br/>1x1 Conv + 全局池化]
-        G --> H[线性层<br/>输出logits]
-        
-        C -.-> I[残差连接]
-        I -.-> D
-        D -.-> J[残差连接]
-        J -.-> E
-        E -.-> K[残差连接]
-        K -.-> F
-    end
-    
-    subgraph "参数统计"
-        L["总参数: ~40K<br/>模型维度: 32<br/>输入维度: 13"]
-    end
-```  
-
-**网络层次说明:**
-
-1. **输入层**: 1×1卷积将13维MFCC特征映射到32维模型空间
-2. **空洞卷积层**: 4层递增空洞率的卷积层 (1, 2, 4, 8)
-3. **残差连接**: 每层输出与输入相加，避免梯度消失
-4. **输出层**: 1×1卷积 + 全局平均池化 + 全连接层
 
 #### 1.2 空洞卷积 vs 普通卷积
 
@@ -206,35 +161,6 @@ graph LR
 | **DilatedWakeNet** | **40K** | **低** | **大** | **优秀** |
 
 
-#### 1.4 与WaveNet的关系
-
-WaveNet引入了**因果卷积**(Causal Convolution)概念，即只使用过去和当前的信息进行预测。空洞卷积与因果卷积的结合产生了强大的序列建模能力:
-
-1. **因果性**: 确保时间顺序，适合实时应用
-2. **空洞性**: 扩大感受野，捕获长程依赖
-3. **残差连接**: 缓解梯度消失，加深网络
-
-**核心代码实现:**
-```python
-# 空洞卷积模块
-class DilatedConv1d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, dilation):
-        super().__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, 
-                             dilation=dilation, padding="same")
-        self.bn = nn.BatchNorm1d(out_channels)
-        
-    def forward(self, x):
-        return F.relu(self.bn(self.conv(x)))
-
-# 主网络结构
-self.dilated_layers = nn.ModuleList([
-    DilatedConv1d(model_dim, model_dim, kernel_size=3, dilation=1),
-    DilatedConv1d(model_dim, model_dim, kernel_size=3, dilation=2),
-    DilatedConv1d(model_dim, model_dim, kernel_size=3, dilation=4),
-    DilatedConv1d(model_dim, model_dim, kernel_size=3, dilation=8),
-])
-```
 
 <!-- 
 #### 1.5 轻量化设计原理
@@ -268,6 +194,172 @@ self.dilated_layers = nn.ModuleList([
 - 使用averaging_frames=5进行时序平滑
 
 -->
+
+
+
+
+---
+
+## 实验分析与问题解决
+
+### 模型训练与性能验证
+
+#### **情况背景 (Situation)**
+在开发过程中，我遇到了一个关键问题：模型在实际部署时出现大量误触发，特别是在环境噪音很小但没有唤醒词的情况下，模型依然表现出很高的置信度。这与训练时94%的准确率形成了明显的对比。
+
+#### **面临任务 (Task)**
+需要系统性地分析和解决以下问题：
+1. 识别模型误触发的根本原因
+2. 验证训练数据质量和特征学习的正确性
+3. 区分PyTorch模型和ONNX转换可能引入的问题
+4. 设计可行的解决方案
+
+#### **采取行动 (Action)**
+
+##### 1. 训练性能分析
+![训练预测结果](output/xiaoqi_20250625_105407/predictions.png)
+
+**训练数据分析：**
+- 使用TTS合成生成正例样本（500+条）
+- 负例数据来自开源数据集（6000+条）
+- 模型在测试集上达到94%准确率
+- 模型大小从 120K优化至60K参数，满足ESP32-S3部署要求
+
+##### 2. 模型行为深度分析
+为了识别问题根源，我们设计了系统性的实验来分析模型对不同类型音频的响应。
+
+![模型行为分析](analysis_results/audio_analysis.png)
+
+**测试场景设计：**
+- **Pure Silence**: 绝对静音
+- **Tiny Noise**: 极小白噪音 (σ=0.001)
+- **Small Noise**: 小白噪音 (σ=0.01)  
+- **Medium Noise**: 中等白噪音 (σ=0.05)
+- **Large Noise**: 大白噪音 (σ=0.1)
+- **TTS-like**: 模拟TTS模式（前后静音，中间有信号）
+- **Anti-TTS**: 反TTS模式（中间静音，前后有信号）
+
+##### 3. MFCC特征模式分析
+![MFCC特征分析](analysis_results/mfcc_features.png)
+
+通过详细的MFCC特征分析，我们发现了关键问题：
+
+**问题发现：**
+1. **静音高置信度现象**: 模型对绝对静音和极小噪音显示出异常高的置信度
+2. **特征学习偏差**: TTS合成数据中的静音段被错误地学习为正特征
+3. **数据分布不匹配**: 训练时的TTS数据（静音段）与实际环境音频（背景噪音）存在分布差异
+
+#### **取得结果 (Result)**
+
+##### 问题根因确认
+通过系统性分析，我们确认了问题的根本原因：
+
+**数据质量问题：**
+- **正例特征**: TTS合成数据包含大量绝对静音段
+- **负例特征**: 真实环境录音包含持续的背景噪音
+- **错误学习**: 模型将"静音"误学习为唤醒词的判别特征
+
+**验证结果：**
+1. ✅ **PyTorch vs ONNX**: 排除了模型转换问题，两种格式表现一致
+2. ✅ **音频采集**: 确认音频流捕获正常，排除硬件问题
+3. ❌ **特征学习**: 发现模型学到了错误的"静音=正例"关联
+
+##### 解决方案设计
+基于分析结果，我们制定了以下解决策略：
+
+**短期解决方案：**
+1. **数据增强**: 为所有TTS正例添加真实环境背景噪音
+2. **负例扩充**: 增加更多静音和极小噪音的负例样本
+3. **阈值调优**: 基于实际使用场景调整检测阈值
+
+**长期优化方案：**
+1. **数据重构**: 使用更真实的录音环境生成训练数据
+2. **对抗训练**: 引入对抗样本提升模型鲁棒性
+3. **多模态融合**: 结合音频能量、频谱特征等多维信息
+
+
+
+---
+
+### 下一步优化计划
+
+1. **数据重训练**: 使用噪音增强的正例数据重新训练模型
+2. **实时优化**: 调整推理间隔和滑动窗口参数
+3. **部署测试**: 在实际ESP32-S3设备上验证优化效果
+4. **持续监控**: 建立线上模型性能监控体系
+
+
+
+
+
+#### 1.1 整体网络结构
+
+本项目采用基于空洞卷积(Dilated Convolution)的轻量级网络架构DilatedWakeNet，专为ESP32-S3等资源受限设备设计。
+
+
+[//]: # (comment)
+
+```mermaid
+graph TB
+    subgraph "DilatedWakeNet架构"
+        A[MFCC输入<br/>13 x 40]-->B[输入卷积层<br/>1x1 Conv, 32通道]
+        B--> C[空洞卷积层1<br/>3x1 Conv, dilation=1]
+        C--> D[空洞卷积层2<br/>3x1 Conv, dilation=2]
+        D --> E[空洞卷积层3<br/>3x1 Conv, dilation=4]
+        E --> F[空洞卷积层4<br/>3x1 Conv, dilation=8]
+        F --> G[输出层<br/>1x1 Conv + 全局池化]
+        G --> H[线性层<br/>输出logits]
+        
+        C -.-> I[残差连接]
+        I -.-> D
+        D -.-> J[残差连接]
+        J -.-> E
+        E -.-> K[残差连接]
+        K -.-> F
+    end
+    
+    subgraph "参数统计"
+        L["总参数: ~40K<br/>模型维度: 32<br/>输入维度: 13"]
+    end
+```  
+
+**网络层次说明:**
+
+1. **输入层**: 1×1卷积将13维MFCC特征映射到32维模型空间
+2. **空洞卷积层**: 4层递增空洞率的卷积层 (1, 2, 4, 8)
+3. **残差连接**: 每层输出与输入相加，避免梯度消失
+4. **输出层**: 1×1卷积 + 全局平均池化 + 全连接层
+
+
+#### 1.4 与WaveNet的关系
+
+WaveNet引入了**因果卷积**(Causal Convolution)概念，即只使用过去和当前的信息进行预测。空洞卷积与因果卷积的结合产生了强大的序列建模能力:
+
+1. **因果性**: 确保时间顺序，适合实时应用
+2. **空洞性**: 扩大感受野，捕获长程依赖
+3. **残差连接**: 缓解梯度消失，加深网络
+
+**核心代码实现:**
+```python
+# 空洞卷积模块
+class DilatedConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, 
+                             dilation=dilation, padding="same")
+        self.bn = nn.BatchNorm1d(out_channels)
+        
+    def forward(self, x):
+        return F.relu(self.bn(self.conv(x)))
+
+# 主网络结构
+self.dilated_layers = nn.ModuleList([
+    DilatedConv1d(model_dim, model_dim, kernel_size=3, dilation=1),
+    DilatedConv1d(model_dim, model_dim, kernel_size=3, dilation=2),
+    DilatedConv1d(model_dim, model_dim, kernel_size=3, dilation=4),
+    DilatedConv1d(model_dim, model_dim, kernel_size=3, dilation=8),
+])
+```
 
 
 空洞卷积是本模型的核心技术，它通过在卷积核中插入空洞(zeros)来扩大感受野，而不增加参数量。

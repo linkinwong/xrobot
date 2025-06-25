@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-实时唤醒词检测推理脚本
-使用训练好的 ONNX 模型进行实时音频流推理
-支持 Linux 和 macOS 跨平台
+使用原始PyTorch模型进行推理，验证torch vs onnx的差异
 """
 
 import os
@@ -15,26 +13,95 @@ import threading
 import queue
 from collections import deque
 from pathlib import Path
+import wave
 
 import numpy as np
 import librosa
-import onnxruntime as ort
 import pyaudio
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from scipy.signal import resample
+
+
+class DilatedConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, padding="same"):
+        super(DilatedConv1d, self).__init__()
+        # 手动计算padding以确保输出长度与输入相同
+        # padding = (kernel_size - 1) * dilation // 2
+        
+        self.conv = nn.Conv1d(
+            in_channels, out_channels, kernel_size, 
+            dilation=dilation, padding=padding
+        )
+        self.bn = nn.BatchNorm1d(out_channels)
+        
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        return F.relu(x)
+
+class DilatedWakeNet(nn.Module):
+    """
+    轻量级的基于空洞卷积的唤醒词检测模型，专为ESP32-S3设计
+    """
+    def __init__(self, input_dim=13, model_dim=32):
+        super(DilatedWakeNet, self).__init__()
+        self.input_dim = input_dim
+        self.model_dim = model_dim
+        
+        # 输入层
+        self.input_conv = nn.Sequential(
+            nn.Conv1d(input_dim, model_dim, kernel_size=1),
+            nn.BatchNorm1d(model_dim),
+            nn.ReLU()
+        )
+        
+        # 空洞卷积层
+        self.dilated_layers = nn.ModuleList([
+            DilatedConv1d(model_dim, model_dim, kernel_size=3, dilation=1),
+            DilatedConv1d(model_dim, model_dim, kernel_size=3, dilation=2),
+            DilatedConv1d(model_dim, model_dim, kernel_size=3, dilation=4),
+            DilatedConv1d(model_dim, model_dim, kernel_size=3, dilation=8),
+        ])
+        
+        # 输出层
+        self.output_layers = nn.Sequential(
+            nn.Conv1d(model_dim, model_dim, kernel_size=1),
+            nn.BatchNorm1d(model_dim),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(model_dim, 1)
+        )
+    
+    def forward(self, x):
+        """
+        输入: (batch_size, n_frames, n_mfcc)
+        输出: (batch_size, 1) - 唤醒词检测得分
+        """
+        # 转置为卷积格式 (batch, channels, seq_len)
+        x = x.transpose(1, 2)  # (batch_size, n_mfcc, n_frames)
+        
+        # 输入卷积
+        x = self.input_conv(x)
+        
+        # 空洞卷积层，带有残差连接
+        residual = x
+        for layer in self.dilated_layers:
+            x = layer(x) + residual
+            residual = x
+        
+        # 输出层
+        x = self.output_layers(x)
+        
+        return x  # 返回logits
 
 
 class AudioBuffer:
     """环形音频缓冲区，用于管理音频流数据"""
     
     def __init__(self, max_length_seconds=5, sample_rate=16000):
-        """
-        初始化音频缓冲区
-        
-        Args:
-            max_length_seconds: 缓冲区最大长度（秒）
-            sample_rate: 采样率
-        """
         self.sample_rate = sample_rate
         self.max_length = int(max_length_seconds * sample_rate)
         self.buffer = deque(maxlen=self.max_length)
@@ -44,12 +111,10 @@ class AudioBuffer:
         """添加音频数据到缓冲区"""
         with self.lock:
             if isinstance(audio_data, bytes):
-                # 转换字节数据为浮点数数组
                 audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
             else:
                 audio_array = np.array(audio_data, dtype=np.float32)
             
-            # 添加到缓冲区
             for sample in audio_array:
                 self.buffer.append(sample)
     
@@ -57,14 +122,12 @@ class AudioBuffer:
         """获取指定长度的音频段"""
         with self.lock:
             if len(self.buffer) < length_samples:
-                # 如果缓冲区长度不足，用零填充
                 audio_segment = np.zeros(length_samples, dtype=np.float32)
                 available_samples = len(self.buffer)
                 if available_samples > 0:
                     audio_segment[-available_samples:] = list(self.buffer)[-available_samples:]
                 return audio_segment
             else:
-                # 获取最近的音频数据
                 return np.array(list(self.buffer)[-length_samples:], dtype=np.float32)
 
 
@@ -72,38 +135,18 @@ class MFCCExtractor:
     """MFCC特征提取器"""
     
     def __init__(self, n_mfcc=13, sample_rate=16000, window_size_ms=30, stride_ms=30, n_frames=40):
-        """
-        初始化MFCC提取器
-        
-        Args:
-            n_mfcc: MFCC特征数量
-            sample_rate: 采样率
-            window_size_ms: 窗口大小（毫秒）
-            stride_ms: 步长（毫秒）
-            n_frames: 目标帧数
-        """
         self.n_mfcc = n_mfcc
         self.sample_rate = sample_rate
         self.n_frames = n_frames
         
-        # 计算窗口和步长（采样点数）
         self.frame_length = int(sample_rate * window_size_ms / 1000)
         self.hop_length = int(sample_rate * stride_ms / 1000)
         
         print(f"MFCC参数: n_mfcc={n_mfcc}, frame_length={self.frame_length}, hop_length={self.hop_length}")
     
     def extract_features(self, audio):
-        """
-        从音频中提取MFCC特征
-        
-        Args:
-            audio: 音频数组
-            
-        Returns:
-            MFCC特征数组，形状为 (n_frames, n_mfcc)
-        """
+        """提取MFCC特征"""
         try:
-            # 提取MFCC特征
             mfcc = librosa.feature.mfcc(
                 y=audio,
                 sr=self.sample_rate,
@@ -114,7 +157,6 @@ class MFCCExtractor:
             
             # 处理特征长度 - 与训练时保持一致
             if mfcc.shape[0] > self.n_frames:
-                # 训练时使用随机选择起始点，推理时为了稳定性，取最后的帧
                 mfcc = mfcc[-self.n_frames:]
             else:
                 # 与训练时保持一致：后向填充（在末尾填充）
@@ -125,22 +167,13 @@ class MFCCExtractor:
         
         except Exception as e:
             print(f"MFCC特征提取失败: {e}")
-            # 返回零特征
             return np.zeros((self.n_frames, self.n_mfcc), dtype=np.float32)
 
 
-class WakeWordDetector:
-    """唤醒词检测器"""
+class PyTorchWakeWordDetector:
+    """PyTorch唤醒词检测器"""
     
-    def __init__(self, model_path, config_path, averaging_frames=5):
-        """
-        初始化唤醒词检测器
-        
-        Args:
-            model_path: ONNX模型路径
-            config_path: 配置文件路径
-            averaging_frames: 平滑预测的帧数
-        """
+    def __init__(self, model_path, config_path, averaging_frames=3):
         # 加载配置
         with open(config_path, 'r') as f:
             self.config = json.load(f)
@@ -156,22 +189,25 @@ class WakeWordDetector:
             n_frames=self.config['n_frames']
         )
         
-        # 加载ONNX模型
-        try:
-            providers = ['CPUExecutionProvider']
-            if ort.get_device() == 'GPU':
-                providers.insert(0, 'CUDAExecutionProvider')
-            
-            self.session = ort.InferenceSession(model_path, providers=providers)
-            print(f"成功加载ONNX模型: {model_path}")
-            print(f"使用推理提供者: {self.session.get_providers()}")
-        except Exception as e:
-            print(f"加载ONNX模型失败: {e}")
-            raise
+        # 创建并加载PyTorch模型
+        self.model = DilatedWakeNet(
+            input_dim=self.config['n_mfcc'],
+            model_dim=self.config['model_dim']
+        )
+        
+        # 加载权重
+        checkpoint = torch.load(model_path, map_location='cpu')
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+        
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
+        print(f"成功加载PyTorch模型: {model_path}")
         
         # 检测参数
-        self.threshold = self.config.get('threshold', 0.5)
-        self.threshold = 0.9
+        self.threshold = 0.9  # 使用高阈值
         self.averaging_frames = averaging_frames
         self.wake_word = self.config['wake_word']
         
@@ -182,18 +218,10 @@ class WakeWordDetector:
         self.total_inferences = 0
         self.inference_times = deque(maxlen=100)
         
-        print(f"唤醒词检测器初始化完成: {self.wake_word}, 阈值: {self.threshold}")
+        print(f"PyTorch唤醒词检测器初始化完成: {self.wake_word}, 阈值: {self.threshold}")
     
     def predict(self, audio):
-        """
-        预测音频中是否包含唤醒词
-        
-        Args:
-            audio: 音频数组
-            
-        Returns:
-            tuple: (检测结果, 置信度, 平滑后的置信度)
-        """
+        """预测音频中是否包含唤醒词"""
         start_time = time.time()
         
         try:
@@ -201,14 +229,15 @@ class WakeWordDetector:
             mfcc_features = self.mfcc_extractor.extract_features(audio)
             
             # 准备模型输入
-            input_data = np.expand_dims(mfcc_features, axis=0)  # 添加batch维度
+            input_tensor = torch.FloatTensor(mfcc_features).unsqueeze(0)  # 添加batch维度
             
             # 运行推理
-            outputs = self.session.run(None, {'mfcc': input_data})
-            logits = outputs[0][0][0]  # 提取logits
+            with torch.no_grad():
+                logits = self.model(input_tensor)
+                logits_value = logits.item()
             
             # 计算概率
-            confidence = 1.0 / (1.0 + np.exp(-logits))  # sigmoid
+            confidence = 1.0 / (1.0 + np.exp(-logits_value))  # sigmoid
             
             # 添加到历史记录
             self.prediction_history.append(confidence)
@@ -227,7 +256,7 @@ class WakeWordDetector:
             return detected, confidence, smoothed_confidence
             
         except Exception as e:
-            print(f"预测失败: {e}")
+            print(f"PyTorch预测失败: {e}")
             return False, 0.0, 0.0
     
     def get_stats(self):
@@ -248,21 +277,11 @@ class WakeWordDetector:
         }
 
 
-class RealTimeWakeWordDetector:
-    """实时唤醒词检测系统"""
+class RealTimePyTorchDetector:
+    """实时PyTorch唤醒词检测系统"""
     
     def __init__(self, model_path, config_path, device_index=None, 
-                 inference_interval_ms=100, averaging_frames=5):
-        """
-        初始化实时检测系统
-        
-        Args:
-            model_path: ONNX模型路径
-            config_path: 配置文件路径
-            device_index: 音频设备索引
-            inference_interval_ms: 推理间隔（毫秒）
-            averaging_frames: 平滑预测的帧数
-        """
+                 inference_interval_ms=300, averaging_frames=3, save_audio=False):
         # 加载配置
         with open(config_path, 'r') as f:
             self.config = json.load(f)
@@ -270,20 +289,30 @@ class RealTimeWakeWordDetector:
         self.sample_rate = self.config['sample_rate']
         self.inference_interval_ms = inference_interval_ms
         self.device_index = device_index
+        self.save_audio = save_audio
         
         # 计算音频参数 - 与训练时保持一致
-        # 训练时模型期望: n_frames * stride_ms = 40 * 30ms = 1.2秒
         expected_duration = (self.config['n_frames'] * self.config['stride_ms']) / 1000.0
-        self.audio_length_seconds = expected_duration  # 1.2秒而不是2.0秒
+        self.audio_length_seconds = expected_duration
         self.audio_length_samples = int(self.audio_length_seconds * self.sample_rate)
         
-        self.chunk_size = 1024  # PyAudio块大小
+        self.chunk_size = 1024
         
         # 初始化检测器
-        self.detector = WakeWordDetector(model_path, config_path, averaging_frames)
+        self.detector = PyTorchWakeWordDetector(model_path, config_path, averaging_frames)
         
         # 初始化音频缓冲区
         self.audio_buffer = AudioBuffer(max_length_seconds=5, sample_rate=self.sample_rate)
+        
+        # 音频录制相关
+        if self.save_audio:
+            self.audio_save_dir = Path("audio_recordings")
+            self.audio_save_dir.mkdir(exist_ok=True)
+            self.recording_buffer = deque(maxlen=int(2.0 * self.sample_rate))  # 2秒的音频
+            self.last_save_time = 0
+            self.save_interval = 2.0  # 每2秒保存一次
+            self.recording_counter = 0
+            print(f"音频录制已启用，保存目录: {self.audio_save_dir}")
         
         # 初始化音频流
         self.audio = pyaudio.PyAudio()
@@ -294,23 +323,15 @@ class RealTimeWakeWordDetector:
         self.detection_enabled = True
         
         # 线程
-        self.audio_thread = None
         self.inference_thread = None
         
         # 结果队列
         self.result_queue = queue.Queue()
         
-        print(f"实时检测系统初始化完成")
+        print(f"PyTorch实时检测系统初始化完成")
         print(f"采样率: {self.sample_rate}, 推理间隔: {inference_interval_ms}ms")
         print(f"音频长度: {self.audio_length_seconds:.1f}s ({self.audio_length_samples} 采样点)")
         print(f"期望帧数: {self.config['n_frames']}, 每帧: {self.config['stride_ms']}ms")
-    
-    def list_audio_devices(self):
-        """列出可用的音频设备"""
-        print("可用的音频设备:")
-        for i in range(self.audio.get_device_count()):
-            info = self.audio.get_device_info_by_index(i)
-            print(f"  {i}: {info['name']} - {info['maxInputChannels']} 输入通道")
     
     def start_audio_stream(self):
         """启动音频流"""
@@ -334,7 +355,31 @@ class RealTimeWakeWordDetector:
         """音频回调函数"""
         if self.running:
             self.audio_buffer.add_audio(in_data)
+            
+            # 如果启用了音频录制，将数据添加到录制缓冲区
+            if self.save_audio:
+                audio_array = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
+                for sample in audio_array:
+                    self.recording_buffer.append(sample)
+                    
         return (None, pyaudio.paContinue)
+    
+    def save_audio_segment(self, audio_data, filename):
+        """保存音频片段到文件"""
+        try:
+            # 转换为16位整数
+            audio_int16 = (audio_data * 32767).astype(np.int16)
+            
+            # 保存为WAV文件
+            with wave.open(str(filename), 'wb') as wav_file:
+                wav_file.setnchannels(1)  # 单声道
+                wav_file.setsampwidth(2)  # 16位
+                wav_file.setframerate(self.sample_rate)
+                wav_file.writeframes(audio_int16.tobytes())
+                
+            print(f"✅ 保存音频: {filename}")
+        except Exception as e:
+            print(f"❌ 保存音频失败: {e}")
     
     def _inference_loop(self):
         """推理循环"""
@@ -344,7 +389,22 @@ class RealTimeWakeWordDetector:
         while self.running:
             current_time = time.time()
             
-            # 检查是否到了推理时间
+            # 检查是否需要保存音频
+            if self.save_audio and current_time - self.last_save_time >= self.save_interval:
+                if len(self.recording_buffer) >= int(1.0 * self.sample_rate):  # 至少1秒的音频
+                    # 获取最近2秒的音频数据
+                    audio_segment = np.array(list(self.recording_buffer), dtype=np.float32)
+                    
+                    # 生成文件名
+                    timestamp = time.strftime("%H%M%S", time.localtime(current_time))
+                    filename = self.audio_save_dir / f"recording_{timestamp}_{self.recording_counter:03d}.wav"
+                    
+                    # 保存音频
+                    self.save_audio_segment(audio_segment, filename)
+                    
+                    self.recording_counter += 1
+                    self.last_save_time = current_time
+            
             if current_time - last_inference_time >= inference_interval_seconds:
                 if self.detection_enabled:
                     # 获取音频数据
@@ -359,13 +419,13 @@ class RealTimeWakeWordDetector:
                         'detected': detected,
                         'confidence': confidence,
                         'smoothed_confidence': smoothed_confidence,
-                        'wake_word': self.detector.wake_word
+                        'wake_word': self.detector.wake_word,
+                        'model_type': 'PyTorch'
                     }
                     
                     try:
                         self.result_queue.put_nowait(result)
                     except queue.Full:
-                        # 队列满了，丢弃旧结果
                         try:
                             self.result_queue.get_nowait()
                             self.result_queue.put_nowait(result)
@@ -374,7 +434,6 @@ class RealTimeWakeWordDetector:
                 
                 last_inference_time = current_time
             
-            # 短暂休眠，避免CPU占用过高
             time.sleep(0.001)
     
     def start(self):
@@ -383,7 +442,7 @@ class RealTimeWakeWordDetector:
             print("检测已经在运行中")
             return
         
-        print("启动实时唤醒词检测...")
+        print("启动PyTorch实时唤醒词检测...")
         self.running = True
         
         # 启动音频流
@@ -393,34 +452,22 @@ class RealTimeWakeWordDetector:
         self.inference_thread = threading.Thread(target=self._inference_loop, daemon=True)
         self.inference_thread.start()
         
-        print("实时检测启动成功!")
+        print("PyTorch实时检测启动成功!")
     
     def stop(self):
         """停止实时检测"""
-        print("停止实时检测...")
+        print("停止PyTorch实时检测...")
         self.running = False
         
-        # 停止音频流
         if self.stream:
             self.stream.stop_stream()
             self.stream.close()
             self.stream = None
         
-        # 等待线程结束
         if self.inference_thread:
             self.inference_thread.join(timeout=1.0)
         
-        print("实时检测已停止")
-    
-    def enable_detection(self):
-        """启用检测"""
-        self.detection_enabled = True
-        print("检测已启用")
-    
-    def disable_detection(self):
-        """禁用检测"""
-        self.detection_enabled = False
-        print("检测已禁用")
+        print("PyTorch实时检测已停止")
     
     def get_result(self, timeout=None):
         """获取检测结果"""
@@ -442,39 +489,32 @@ class RealTimeWakeWordDetector:
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description="实时唤醒词检测")
+    parser = argparse.ArgumentParser(description="PyTorch实时唤醒词检测")
     
-    # 模型参数
     parser.add_argument("--model_dir", type=str, 
                        default="./models/xiaoqi",
                        help="模型目录路径")
-    
-    # 音频参数
     parser.add_argument("--device", type=int, default=None,
-                       help="音频设备索引 (使用 --list_devices 查看可用设备)")
-    parser.add_argument("--list_devices", action="store_true",
-                       help="列出可用的音频设备")
-    
-    # 推理参数
+                       help="音频设备索引")
     parser.add_argument("--inference_interval", type=int, default=300,
                        help="推理间隔(毫秒)")
     parser.add_argument("--averaging_frames", type=int, default=3,
                        help="平滑预测的帧数")
-    
-    # 其他参数
     parser.add_argument("--verbose", action="store_true",
                        help="详细输出")
+    parser.add_argument("--save_audio", action="store_true",
+                       help="每2秒保存音频片段用于验证")
     
     args = parser.parse_args()
     
     # 构建模型文件路径
     model_dir = Path(args.model_dir)
-    model_path = model_dir / "wakenet_model.onnx"
+    model_path = model_dir / "best_model.pth"  # 使用PyTorch权重文件
     config_path = model_dir / "config.json"
     
     # 检查文件是否存在
     if not model_path.exists():
-        print(f"错误: 模型文件不存在: {model_path}")
+        print(f"错误: PyTorch模型文件不存在: {model_path}")
         sys.exit(1)
     
     if not config_path.exists():
@@ -483,41 +523,36 @@ def main():
     
     try:
         # 创建检测器
-        detector = RealTimeWakeWordDetector(
+        detector = RealTimePyTorchDetector(
             model_path=str(model_path),
             config_path=str(config_path),
             device_index=args.device,
             inference_interval_ms=args.inference_interval,
-            averaging_frames=args.averaging_frames
+            averaging_frames=args.averaging_frames,
+            save_audio=args.save_audio
         )
-        
-        # 如果需要列出设备
-        if args.list_devices:
-            detector.list_audio_devices()
-            return
         
         # 启动检测
         detector.start()
         
-        print(f"\n开始监听唤醒词: '{detector.detector.wake_word}'")
-        print("按 'q' 退出, 'p' 暂停/恢复检测, 's' 显示统计信息")
+        print(f"\n开始监听唤醒词 (PyTorch版本): '{detector.detector.wake_word}'")
+        print("按 'q' 退出, 's' 显示统计信息")
         print("-" * 60)
         
         # 主循环
         try:
             while True:
-                # 获取检测结果
                 result = detector.get_result(timeout=0.1)
                 
                 if result:
                     timestamp_str = time.strftime("%H:%M:%S", time.localtime(result['timestamp']))
                     
                     if result['detected']:
-                        print(f"🎯 [{timestamp_str}] 检测到唤醒词! "
+                        print(f"🎯 [{timestamp_str}] [PyTorch] 检测到唤醒词! "
                               f"置信度: {result['confidence']:.3f}, "
                               f"平滑: {result['smoothed_confidence']:.3f}")
                     elif args.verbose:
-                        print(f"   [{timestamp_str}] "
+                        print(f"   [{timestamp_str}] [PyTorch] "
                               f"置信度: {result['confidence']:.3f}, "
                               f"平滑: {result['smoothed_confidence']:.3f}")
                 
@@ -530,11 +565,6 @@ def main():
                     
                     if key == 'q':
                         break
-                    elif key == 'p':
-                        if detector.detection_enabled:
-                            detector.disable_detection()
-                        else:
-                            detector.enable_detection()
                     elif key == 's':
                         stats = detector.get_stats()
                         print(f"\n统计信息:")
@@ -549,7 +579,7 @@ def main():
         
         # 停止检测
         detector.stop()
-        print("检测已停止")
+        print("PyTorch检测已停止")
         
     except Exception as e:
         print(f"运行错误: {e}")

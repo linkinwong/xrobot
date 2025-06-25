@@ -6,3 +6,6 @@ onnxruntime>=1.8.0
 soundfile>=0.10.0
 tqdm>=4.60.0
 matplotlib>=3.4.0
+# 实时唤醒词检测推理依赖包
+pyaudio>=0.2.11
+scipy>=1.7.0

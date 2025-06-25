@@ -1,0 +1,11 @@
+{
+    "sample_rate": 16000,
+    "n_mfcc": 13,
+    "window_size_ms": 30,
+    "stride_ms": 30,
+    "n_frames": 40,
+    "model_dim": 32,
+    "wake_word": "xiaoqi",
+    "threshold": 0.5,
+    "averaging_frames": 5
+}

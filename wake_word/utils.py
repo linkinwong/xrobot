@@ -53,25 +53,29 @@ def visualize_predictions(model, dataset, num_samples=5):
     model.eval()
     fig, axes = plt.subplots(num_samples, 2, figsize=(12, 3*num_samples))
     
+    # 获取模型所在的设备
+    device = next(model.parameters()).device
+    
     for i in range(num_samples):
         # 获取样本
         mfcc, label = dataset[i]
-        mfcc_batch = mfcc.unsqueeze(0)
+        mfcc_batch = mfcc.unsqueeze(0).to(device)  # 移到模型相同的设备
         
         # 预测
         with torch.no_grad():
             logits = model(mfcc_batch)
             proba = torch.sigmoid(logits).item()
         
-        # 绘制MFCC
-        axes[i, 0].imshow(mfcc.numpy().T, aspect='auto', origin='lower')
-        axes[i, 0].set_title(f'MFCC - 真实标签: {label.item()}')
-        axes[i, 0].set_ylabel('MFCC特征')
-        axes[i, 0].set_xlabel('时间帧')
+        # 绘制MFCC (确保在CPU上进行绘制)
+        mfcc_cpu = mfcc.cpu() if mfcc.is_cuda else mfcc
+        axes[i, 0].imshow(mfcc_cpu.numpy().T, aspect='auto', origin='lower')
+        axes[i, 0].set_title(f'MFCC - True Label: {label.item()}')
+        axes[i, 0].set_ylabel('MFCC Features')
+        axes[i, 0].set_xlabel('Time Frames')
         
         # 绘制预测概率
-        axes[i, 1].bar(['非唤醒词', '唤醒词'], [1-proba, proba])
-        axes[i, 1].set_title(f'预测概率 - 预测: {proba:.2f} > 0.5 = {proba > 0.5}')
+        axes[i, 1].bar(['Non-wake', 'Wake'], [1-proba, proba])
+        axes[i, 1].set_title(f'Prediction Probability - Pred: {proba:.2f} > 0.5 = {proba > 0.5}')
         axes[i, 1].set_ylim(0, 1)
     
     plt.tight_layout()

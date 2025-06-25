@@ -14,6 +14,12 @@ from dataset import WakeWordDataset, create_sample_dataset
 from utils import setup_logger, save_config, load_config, calculate_model_size, visualize_predictions
 from convert import convert_to_onnx, quantize_model
 
+# python pipeline.py --data_dir ./my_dataset --wake_word "nihaoxiaoqi" --epochs 2 --batch_size 8 --create_new_data --resplit_data
+# python pipeline.py --data_dir ./my_dataset --wake_word "xiaoqi" --epochs 2 --batch_size 64  --resplit_data --num_workers 20
+# nohup  python pipeline.py --data_dir ./my_dataset --wake_word "xiaoqi" --epochs 2 --batch_size 64  --resplit_data --num_workers 20  > train_log_june_24_21_31 2>&1 &
+
+all_wake_words = ["你好小灵", "你好小七", "嗨, 小七", "嗨,小灵", "嘿,小七",  "嘿,小灵", "小七小七", "小灵小灵"] 
+
 def generate_and_split_dataset(data_root, wake_word, logger, create_new_data=False, resplit_data=False, sample_rate=16000):
     """
     Generate sample dataset and split into train/val/test sets
@@ -209,8 +215,8 @@ def train_model_directly(model, train_loader, val_loader, device, epochs, learni
     logger.info("Converting to ONNX model...")
     onnx_path = os.path.join(output_dir, "wakenet_model.onnx")
     
-    # Create a sample input for ONNX conversion
-    sample_input = torch.randn(1, 40, 13)  # (batch, frames, features)
+    # Create a sample input for ONNX conversion and move to same device as model
+    sample_input = torch.randn(1, 40, 13).to(device)  # (batch, frames, features)
     model.eval()
     
     with torch.no_grad():

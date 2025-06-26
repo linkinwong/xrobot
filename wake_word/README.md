@@ -224,7 +224,7 @@ graph LR
 #### **采取行动 (Action)**
 
 ##### 1. 训练性能分析
-![训练预测结果](output/xiaoqi_20250625_105407/predictions.png)
+![训练预测结果](analysis_results/predictions.png)
 
 **训练数据分析：**
 - 使用TTS合成生成正例样本（500+条）

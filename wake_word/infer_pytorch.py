@@ -207,7 +207,7 @@ class PyTorchWakeWordDetector:
         print(f"成功加载PyTorch模型: {model_path}")
         
         # 检测参数
-        self.threshold = 0.9  # 使用高阈值
+        self.threshold = 0.8  # 使用高阈值
         self.averaging_frames = averaging_frames
         self.wake_word = self.config['wake_word']
         

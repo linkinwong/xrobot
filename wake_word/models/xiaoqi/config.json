@@ -7,5 +7,5 @@
     "model_dim": 32,
     "wake_word": "xiaoqi",
     "threshold": 0.5,
-    "averaging_frames": 5
+    "averaging_frames": 4
 }

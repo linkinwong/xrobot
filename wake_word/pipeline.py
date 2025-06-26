@@ -1,4 +1,5 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 import argparse
 import torch
 import numpy as np
@@ -13,6 +14,7 @@ from model import DilatedWakeNet
 from dataset import WakeWordDataset, create_sample_dataset
 from utils import setup_logger, save_config, load_config, calculate_model_size, visualize_predictions
 from convert import convert_to_onnx, quantize_model
+from create_enhanced_negative_samples import create_enhanced_negative_samples
 
 # python pipeline.py --data_dir ./my_dataset --wake_word "nihaoxiaoqi" --epochs 2 --batch_size 8 --create_new_data --resplit_data
 # python pipeline.py --data_dir ./my_dataset --wake_word "xiaoqi" --epochs 2 --batch_size 64  --resplit_data --num_workers 20
@@ -118,6 +120,18 @@ def generate_and_split_dataset(data_root, wake_word, logger, create_new_data=Fal
     logger.info(f"  Train: {len(pos_train)} positive, {len(neg_train)} negative")
     logger.info(f"  Val: {len(pos_val)} positive, {len(neg_val)} negative")
     logger.info(f"  Test: {len(pos_test)} positive, {len(neg_test)} negative")
+
+
+def enhance_negative_samples_for_silence_fix(data_root):
+    """
+    专门为解决静音误触发问题增强负例样本
+    """
+    create_enhanced_negative_samples(
+        output_dir=f"{data_root}/raw",  # 添加到现有数据中
+        sample_rate=16000,
+        duration=1.2  # 与训练配置一致
+    )
+    print("🎯 静音误触发修复：负例增强完成！")
 
 def train_model_directly(model, train_loader, val_loader, device, epochs, learning_rate, output_dir, logger):
     """

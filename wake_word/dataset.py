@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 from pathlib import Path
 from tqdm import tqdm
 
+
 class WakeWordDataset(Dataset):
     def __init__(self, 
                  data_dir, 
